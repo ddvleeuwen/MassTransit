@@ -17,6 +17,7 @@ namespace MassTransit.KafkaIntegration.Checkpoints
         readonly IConsumer<byte[], byte[]> _consumer;
         readonly ReceiveSettings _settings;
         readonly CancellationToken _cancellationToken;
+        bool _canceled;
 
         public BatchCheckpointer(IConsumer<byte[], byte[]> consumer, ReceiveSettings settings, CancellationToken cancellationToken)
         {
@@ -80,7 +81,24 @@ namespace MassTransit.KafkaIntegration.Checkpoints
                     {
                         if (_channel.Reader.TryRead(out var confirmation))
                         {
-                            await confirmation.Confirmed.OrCanceled(_cancellationToken).ConfigureAwait(false);
+                            // once a message was canceled (not consumed), no later offset may be committed,
+                            // otherwise the canceled message is skipped and never redelivered
+                            if (_canceled)
+                                continue;
+
+                            try
+                            {
+                                await confirmation.Confirmed.OrCanceled(_cancellationToken).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException) when (confirmation.Confirmed.IsCanceled)
+                            {
+                                _canceled = true;
+
+                                LogContext.Debug?.Log("Partition: {PartitionId} offset {Offset} was canceled, no further checkpoints on {MemberId}",
+                                    confirmation.Partition, confirmation.Offset, _consumer.MemberId);
+                                break;
+                            }
+
                             batch.Add(confirmation);
                         }
                         else if (await _channel.Reader.WaitToReadAsync(batchToken.Token).ConfigureAwait(false) == false)
